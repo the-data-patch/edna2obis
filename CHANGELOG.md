@@ -6,6 +6,9 @@ See [docs/RELEASING.md](docs/RELEASING.md) for how releases are made.
 
 ## [Unreleased]
 
+### Added
+- `python main.py --config <file>` (`-c`) runs with any config file, without editing `config.yaml`'s `run_config_path`. `python main.py --help` lists the options ([#12](https://github.com/the-data-patch/edna2obis/issues/12)).
+
 ### Changed
 - WoRMS `higherClassification` cache (`worms_higherClassification_cache.pkl`) now lives in `output_dir` (`outputs/` by default) and is shared by all runs, instead of each run's own folder. Existing per-run caches are merged in automatically.
 

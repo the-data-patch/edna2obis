@@ -4,6 +4,7 @@ edna2obis Main Script
 Converts eDNA sequence data from FAIRe NOAA format to Darwin Core for OBIS and GBIF submission
 """
 
+import argparse
 import os
 import sys
 import csv
@@ -1966,25 +1967,47 @@ def load_darwin_core_mappings(params, reporter):
         raise Exception(error_msg)
 
 
-def main():
+def resolve_config_path(cli_config_path=None, default_config_path="config.yaml"):
+    """
+    Decide which config file to run with.
+    --config wins; otherwise read config.yaml and follow its run_config_path, if set.
+    """
+    if cli_config_path:
+        return cli_config_path
+
+    with open(default_config_path, 'r', encoding='utf-8') as f:
+        initial_config = yaml.safe_load(f) or {}
+
+    run_config_path = initial_config.get('run_config_path')
+    if run_config_path and run_config_path != default_config_path:
+        return run_config_path
+    return default_config_path
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="python main.py",
+        description="Convert FAIRe eDNA data into a Darwin Core Archive for OBIS and GBIF.",
+    )
+    parser.add_argument(
+        '-c', '--config', default=None, metavar='FILE',
+        help="Config file to run with. Defaults to config.yaml, or the file its "
+             "run_config_path points to.",
+    )
+    parser.add_argument('--version', action='version', version=f'edna2obis {__version__}')
+    return parser.parse_args(argv)
+
+
+def main(config_path=None):
     """Main execution function"""
     # --- Load config first to get params for reporter initialization ---
     print_header()
     print_usage()
     print_separator("Starting Conversion")
 
-    # Always load the default config file first to check for a custom path
-    default_config_path = "config.yaml"
-    final_config_path = default_config_path
-    
     try:
-        with open(default_config_path, 'r', encoding='utf-8') as f:
-            initial_config = yaml.safe_load(f)
-
-        # Check if a different config file is specified within the default config
-        if 'run_config_path' in initial_config and initial_config['run_config_path'] and initial_config['run_config_path'] != default_config_path:
-            final_config_path = initial_config['run_config_path']
-            console.print(f"Using config file: {final_config_path}")
+        final_config_path = resolve_config_path(config_path)
+        console.print(f"Using config file: {final_config_path}")
 
         # Load the final configuration
         params = load_config(final_config_path)
@@ -2442,7 +2465,5 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--version" in sys.argv[1:]:
-        print(f"edna2obis {__version__}")
-        sys.exit(0)
-    main() 
+    args = parse_args()
+    main(config_path=args.config) 
