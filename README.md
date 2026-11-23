@@ -69,7 +69,7 @@ python main.py
 
 The default `config.yaml` runs the small FAIRe NOAA example in [`data/example_raw/FAIRe_NOAA_example_dataset_small/`](data/example_raw/FAIRe_NOAA_example_dataset_small/) and writes results to `outputs/EXAMPLE_OUTPUT_FAIRE_NOAA_SMALL/`. The HTML report opens in your browser when the run finishes.
 
-**4. Run your own data:** prepare your files ([Preparing your data](#preparing-your-data)), point `config.yaml` at them ([Configuration](#configuration)) and run `python main.py` again.
+**4. Run your own data:** prepare your files ([Preparing your data](#preparing-your-data)), point a config file at them ([Configuration](#configuration)) and run `python main.py` again, or `python main.py --config your_config.yaml` to use a config file other than `config.yaml`.
 
 ## Preparing your data
 
@@ -97,7 +97,7 @@ All configuration files are in the repository root.
 | File | What it controls |
 |---|---|
 | [`config.yaml`](config.yaml) | The run: input paths, metadata format, taxonomy API and matching options, output folder, optional outputs. Read by `main.py`. |
-| [`EXAMPLE_config_FAIRe_noaa.yaml`](EXAMPLE_config_FAIRe_noaa.yaml), [`EXAMPLE_config_FAIRe_generic.yaml`](EXAMPLE_config_FAIRe_generic.yaml) | Starting points for each format. Copy one over `config.yaml`, or set `run_config_path` in `config.yaml` to point at your own file. |
+| [`EXAMPLE_config_FAIRe_noaa.yaml`](EXAMPLE_config_FAIRe_noaa.yaml), [`EXAMPLE_config_FAIRe_generic.yaml`](EXAMPLE_config_FAIRe_generic.yaml) | Starting points for each format. Copy one over `config.yaml`, or copy it under a new name and run `python main.py --config <file>`. (Setting `run_config_path` in `config.yaml` also works.) |
 | [`data_mapper.yaml`](data_mapper.yaml) | Which FAIRe fields map to which Darwin Core terms in each output |
 | [`EML_config.yaml`](EML_config.yaml), [`contacts.yaml`](contacts.yaml) | Dataset metadata and people for `eml.xml` |
 | [`data/example_raw/eMoF_Fields_edna2obis.tsv`](data/example_raw/eMoF_Fields_edna2obis.tsv) | Measurements written to the eMoF ([details](docs/outputs.md#emof-extended-measurement-or-fact)) |

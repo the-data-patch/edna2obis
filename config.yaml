@@ -3,9 +3,9 @@
 
 # ================================STEP 1========================================
 # --- OPTIONAL: Specify a path to a different config file for the run ---
-# If you want to use a config file other than this default 'config.yaml',
-# you can specify its path here. The pipeline will then load that file.
-# If left blank or set to 'config.yaml', this file will be used.
+# Easiest: run `python main.py --config path/to/your_config.yaml` and leave this as is.
+# Alternatively, set a path here and `python main.py` (without --config) will load that file.
+# If left blank or set to 'config.yaml', this file will be used. --config overrides this setting.
 run_config_path: "config.yaml"
 metadata_format: "NOAA"  # "NOAA" or "GENERIC". NOAA format has separate analysisMetadata sheets. GENERIC format has analysis data within projectMetadata.
 edna2obis_run_name: "EXAMPLE_OUTPUT_FAIRE_NOAA_SMALL" # This name will be used to name your config file (outputted for your convenience after your run is complete)

@@ -6,6 +6,16 @@ See [docs/RELEASING.md](docs/RELEASING.md) for how releases are made.
 
 ## [Unreleased]
 
+### Added
+- `python main.py --config <file>` (`-c`) runs with any config file, without editing `config.yaml`'s `run_config_path`. `python main.py --help` lists the options ([#12](https://github.com/the-data-patch/edna2obis/issues/12)).
+
+### Changed
+- WoRMS `higherClassification` cache (`worms_higherClassification_cache.pkl`) now lives in `output_dir` (`outputs/` by default) and is shared by all runs, instead of each run's own folder. Existing per-run caches are merged in automatically.
+
+### Fixed
+- WoRMS `higherClassification` lookups could hang for close to an hour per taxon when WoRMS was unresponsive (pyworms waits 300 s and retries 10 times). They now time out after 30 s, retry 3 times, and stop after 10 failures in a row, warning how many taxa were left blank ([#11](https://github.com/the-data-patch/edna2obis/issues/11)).
+- The `higherClassification` cache is saved as lookups complete and when a run is interrupted, so stopped runs keep their progress ([#11](https://github.com/the-data-patch/edna2obis/issues/11)).
+
 ## [4.0.0] - 2026-11-16
 
 ### Changed

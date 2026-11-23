@@ -45,7 +45,7 @@ def print_usage() -> None:
     # Mode 1: Main pipeline (preferred)
     table.add_row(
         "Mode 1",
-        "python main.py",
+        "python main.py [--config FILE]",
         "Main pipeline: Occurrence Core, DNA Derived Extension, optional eMoF, optional EML, "
         "Taxa Mapping INFO, and HTML Report",
     )

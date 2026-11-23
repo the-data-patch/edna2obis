@@ -1,5 +1,9 @@
 import pyworms
+from pyworms import utils as pyworms_utils
 import pandas as pd
+import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocess as mp
 import time
 from functools import partial
@@ -51,6 +55,18 @@ WORMS_HIGHER_CLASSIFICATION_RANKS = [
 # Parallel WoRMS classification fetches for higherClassification (I/O bound; cap limits API load).
 _HIGHER_CLASSIFICATION_MAX_WORKERS = 6
 
+# higherClassification lookups go straight to the WoRMS REST API (not through pyworms), so that
+# an unresponsive WoRMS fails within minutes instead of holding each request for up to ~56 minutes.
+_WORMS_REST_URL = 'https://www.marinespecies.org/rest/'
+_WORMS_HC_TIMEOUT = (10, 30)           # seconds: (connect, read between bytes)
+_WORMS_HC_RETRIES = 3                  # retries after the first attempt
+_WORMS_HC_BACKOFF_SECONDS = 2          # wait before retry n is 2, 4, 8 s
+_WORMS_HC_MAX_CONSECUTIVE_FAILURES = 10  # stop all lookups after this many failures in a row
+_HIGHER_CLASSIFICATION_SAVE_EVERY = 50   # write the cache after this many new results
+_HIGHER_CLASSIFICATION_CACHE_FILENAME = 'worms_higherClassification_cache.pkl'
+
+_thread_local = threading.local()
+
 
 def _format_environment(record):
     """
@@ -76,20 +92,12 @@ def _format_environment(record):
     return ';'.join(environments) if environments else None
 
 
-def _get_higher_classification(aphia_id):
+def _format_higher_classification(classification):
     """
-    Build a Darwin Core higherClassification string from the WoRMS classification payload.
+    Build a Darwin Core higherClassification string from a flattened WoRMS classification.
     WoRMS returns a flat rank dictionary here, not a nested `child` tree.
     Use ' | ' as the separator and exclude the matched leaf taxon itself.
     """
-    if not aphia_id:
-        return None
-
-    try:
-        classification = pyworms.aphiaClassificationByAphiaID(aphia_id)
-    except Exception:
-        return None
-
     if not isinstance(classification, dict) or not classification:
         return None
 
@@ -118,6 +126,61 @@ def _get_higher_classification(aphia_id):
     return ' | '.join(higher_taxa) if higher_taxa else None
 
 
+class WormsRequestError(Exception):
+    """Raised when WoRMS could not be reached or did not answer after all retries."""
+
+
+def _get_worms_session():
+    """
+    Return a requests.Session for the current thread (Session is not guaranteed thread-safe).
+    """
+    session = getattr(_thread_local, 'worms_session', None)
+    if session is None:
+        session = requests.Session()
+        _thread_local.worms_session = session
+    return session
+
+
+def _fetch_worms_classification(aphia_id):
+    """
+    Fetch the WoRMS classification for an AphiaID and flatten it to a rank dictionary.
+
+    Unlike pyworms (300 s timeout, up to 10 retries), this gives up on a request that
+    stalls for _WORMS_HC_TIMEOUT and retries only _WORMS_HC_RETRIES times, so an
+    unresponsive WoRMS cannot hold a worker for close to an hour.
+
+    Returns the flattened classification, or None when WoRMS has no classification
+    for this AphiaID. Raises WormsRequestError when no answer could be obtained.
+    """
+    url = f'{_WORMS_REST_URL}AphiaClassificationByAphiaID/{int(aphia_id)}'
+    last_error = None
+
+    for attempt in range(_WORMS_HC_RETRIES + 1):
+        if attempt:
+            time.sleep(_WORMS_HC_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+        try:
+            response = _get_worms_session().get(url, timeout=_WORMS_HC_TIMEOUT)
+        except requests.RequestException as e:
+            last_error = f'{type(e).__name__}: {e}'
+            continue
+
+        # Same meaning as in pyworms: 204 and 400 are "nothing found", not failures.
+        if response.status_code in (204, 400):
+            return None
+        if response.status_code == 200:
+            try:
+                return pyworms_utils.flatten(response.json())
+            except (ValueError, KeyError, TypeError, AttributeError) as e:
+                raise WormsRequestError(f'Unexpected response for AphiaID {aphia_id}: {e}') from e
+
+        last_error = f'HTTP {response.status_code}'
+        # Only server-side errors and rate limiting are worth retrying.
+        if response.status_code != 429 and response.status_code < 500:
+            break
+
+    raise WormsRequestError(f'AphiaID {aphia_id}: {last_error}')
+
+
 def _extract_aphia_id_from_lsid(scientific_name_id):
     """
     Extract the numeric AphiaID from a WoRMS LSID string.
@@ -137,20 +200,40 @@ def _extract_aphia_id_from_lsid(scientific_name_id):
 
 def _get_higher_classification_worker(scientific_name_id):
     """
-    Worker wrapper for fetching higherClassification by scientificNameID / AphiaID.
+    Fetch higherClassification for one scientificNameID / AphiaID.
+
+    Returns (scientific_name_id, status, value), where status is:
+      'ok'     - value holds the higherClassification string
+      'empty'  - WoRMS answered but has no usable lineage for this taxon
+      'failed' - WoRMS could not be reached; value holds the error message
     """
     aphia_id = _extract_aphia_id_from_lsid(scientific_name_id)
-    return scientific_name_id, _get_higher_classification(aphia_id)
+    if aphia_id is None:
+        return scientific_name_id, 'empty', None
+
+    try:
+        classification = _fetch_worms_classification(aphia_id)
+    except WormsRequestError as e:
+        return scientific_name_id, 'failed', str(e)
+
+    value = _format_higher_classification(classification)
+    if value is None:
+        return scientific_name_id, 'empty', None
+    return scientific_name_id, 'ok', value
 
 
-def _load_higher_classification_cache(output_dir):
+def _higher_classification_cache_path(cache_dir):
+    return os.path.join(cache_dir, _HIGHER_CLASSIFICATION_CACHE_FILENAME)
+
+
+def _load_higher_classification_cache(cache_dir):
     """
     Load cached higherClassification lookups from disk if available.
     """
-    if not output_dir:
+    if not cache_dir:
         return {}
 
-    cache_path = os.path.join(output_dir, 'worms_higherClassification_cache.pkl')
+    cache_path = _higher_classification_cache_path(cache_dir)
     if not os.path.exists(cache_path):
         return {}
 
@@ -169,30 +252,97 @@ def _load_higher_classification_cache(output_dir):
         return {}
 
 
-def _save_higher_classification_cache(output_dir, cache):
+def _save_higher_classification_cache(cache_dir, cache):
     """
     Persist higherClassification lookups so repeated runs do not re-fetch them.
+    Writes to a temporary file and renames it, so an interrupted write cannot corrupt the cache.
     """
-    if not output_dir or not isinstance(cache, dict):
+    if not cache_dir or not isinstance(cache, dict):
         return
 
-    cache_path = os.path.join(output_dir, 'worms_higherClassification_cache.pkl')
+    cache_path = _higher_classification_cache_path(cache_dir)
+    tmp_path = cache_path + '.tmp'
     try:
+        os.makedirs(cache_dir, exist_ok=True)
         cache_to_save = {
             str(k).strip(): str(v).strip()
             for k, v in cache.items()
             if k is not None and not pd.isna(k) and v is not None and not pd.isna(v) and str(v).strip()
         }
-        with open(cache_path, 'wb') as f:
+        with open(tmp_path, 'wb') as f:
             pickle.dump(cache_to_save, f)
-    except Exception:
-        pass
+        os.replace(tmp_path, cache_path)
+    except Exception as e:
+        logging.warning(f'Could not save higherClassification cache to {cache_path}: {e}')
 
 
-def _enrich_higher_classification_dataframes(source_df, target_dataframes, output_dir='.', n_proc=1):
+def _fetch_higher_classifications(ids_to_fetch, cache, cache_dir, n_workers):
+    """
+    Fetch higherClassification for ids_to_fetch, adding results to cache as they arrive.
+
+    - Saves the cache every _HIGHER_CLASSIFICATION_SAVE_EVERY new results and again on exit,
+      including on Ctrl-C or an error, so an interrupted run keeps its progress.
+    - Stops sending requests after _WORMS_HC_MAX_CONSECUTIVE_FAILURES failures in a row
+      (WoRMS is most likely down), instead of working through every remaining taxon.
+
+    Returns a dict of counts: ok, empty, failed, skipped.
+    """
+    counts = {'ok': 0, 'empty': 0, 'failed': 0, 'skipped': 0}
+    total = len(ids_to_fetch)
+    unsaved = 0
+    consecutive_failures = 0
+    last_error = None
+    done = 0
+    progress_every = max(1, min(100, total // 10))
+
+    executor = ThreadPoolExecutor(max_workers=n_workers)
+    futures = [executor.submit(_get_higher_classification_worker, sid) for sid in ids_to_fetch]
+    try:
+        for future in as_completed(futures):
+            scientific_name_id, status, value = future.result()
+            counts[status] += 1
+            done += 1
+
+            if status == 'failed':
+                consecutive_failures += 1
+                last_error = value
+            else:
+                consecutive_failures = 0
+
+            if status == 'ok':
+                cache[scientific_name_id] = value
+                unsaved += 1
+                if unsaved >= _HIGHER_CLASSIFICATION_SAVE_EVERY:
+                    _save_higher_classification_cache(cache_dir, cache)
+                    unsaved = 0
+
+            if done % progress_every == 0 or done == total:
+                logging.info(f'  ... higherClassification progress: {done}/{total} '
+                             f'({counts["failed"]} failed).')
+
+            if consecutive_failures >= _WORMS_HC_MAX_CONSECUTIVE_FAILURES:
+                logging.warning(
+                    f'WoRMS appears to be unavailable: {consecutive_failures} higherClassification '
+                    f'lookups failed in a row (last error: {last_error}). Stopping lookups.'
+                )
+                break
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        counts['skipped'] = total - done
+        if unsaved:
+            _save_higher_classification_cache(cache_dir, cache)
+
+    return counts
+
+
+def _enrich_higher_classification_dataframes(source_df, target_dataframes, cache_dir='.', n_proc=1,
+                                            legacy_cache_dir=None):
     """
     Populate higherClassification once per unique scientificNameID across the target outputs.
     This keeps the final occurrence core and taxa mapping info file aligned.
+
+    cache_dir holds the shared lookup cache (outputs/ by default, so every run reuses it).
+    legacy_cache_dir is an older per-run folder whose cache is merged in if present.
     """
     valid_targets = [
         df for df in target_dataframes
@@ -219,27 +369,36 @@ def _enrich_higher_classification_dataframes(source_df, target_dataframes, outpu
     if not unique_scientific_name_ids:
         return
 
-    cache = _load_higher_classification_cache(output_dir)
+    cache = {}
+    if legacy_cache_dir and os.path.abspath(legacy_cache_dir) != os.path.abspath(cache_dir or '.'):
+        cache.update(_load_higher_classification_cache(legacy_cache_dir))
+    cache.update(_load_higher_classification_cache(cache_dir))
+
     ids_to_fetch = [scientific_name_id for scientific_name_id in unique_scientific_name_ids if scientific_name_id not in cache]
+    logging.info(
+        f'higherClassification: {len(unique_scientific_name_ids) - len(ids_to_fetch)} of '
+        f'{len(unique_scientific_name_ids)} taxa found in cache '
+        f'({_higher_classification_cache_path(cache_dir)}).'
+    )
 
-    fetch_n_proc = min(max(int(n_proc or 1), 1), _HIGHER_CLASSIFICATION_MAX_WORKERS)
     if ids_to_fetch:
-        logging.info(f"Fetching higherClassification for {len(ids_to_fetch)} uncached WoRMS taxa.")
+        fetch_workers = min(max(int(n_proc or 1), 1), _HIGHER_CLASSIFICATION_MAX_WORKERS, len(ids_to_fetch))
+        logging.info(f'Fetching higherClassification for {len(ids_to_fetch)} uncached WoRMS taxa '
+                     f'with {fetch_workers} parallel requests.')
+        counts = _fetch_higher_classifications(ids_to_fetch, cache, cache_dir, fetch_workers)
 
-        if len(ids_to_fetch) == 1 or fetch_n_proc == 1:
-            classification_results = [
-                _get_higher_classification_worker(scientific_name_id) for scientific_name_id in ids_to_fetch
-            ]
-        else:
-            ctx = _get_mp_context()
-            with ctx.Pool(processes=fetch_n_proc) as pool:
-                classification_results = pool.map(_get_higher_classification_worker, ids_to_fetch)
-
-        for scientific_name_id, value in classification_results:
-            if value is not None and str(value).strip():
-                cache[scientific_name_id] = str(value).strip()
-
-        _save_higher_classification_cache(output_dir, cache)
+        logging.info(
+            f'higherClassification lookups: {counts["ok"]} fetched, '
+            f'{counts["empty"]} without a WoRMS lineage, {counts["failed"]} failed, '
+            f'{counts["skipped"]} not attempted.'
+        )
+        missing = counts['failed'] + counts['skipped']
+        if missing:
+            logging.warning(
+                f'{missing} taxa have no higherClassification because WoRMS could not be reached. '
+                f'Rerun later to fill them in; the {len(cache)} lookups already done are cached in '
+                f'{_higher_classification_cache_path(cache_dir)}.'
+            )
 
     for df in valid_targets:
         if 'higherClassification' not in df.columns:
@@ -890,8 +1049,9 @@ def get_worms_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
         _enrich_higher_classification_dataframes(
             source_df=results_df,
             target_dataframes=[results_df, info_df],
-            output_dir=params_dict.get('output_dir', '.'),
+            cache_dir=params_dict.get('worms_cache_dir') or params_dict.get('output_dir', '.'),
             n_proc=n_proc,
+            legacy_cache_dir=params_dict.get('output_dir'),
         )
         params_dict['worms_higher_classification_seconds'] = time.perf_counter() - hc_t0
 

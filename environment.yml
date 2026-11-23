@@ -8,6 +8,7 @@ dependencies:
   - numpy
   - openpyxl
   - pyworms
+  - requests
   - multiprocess
   - pygbif
   - pytz

@@ -36,6 +36,14 @@ Taxonomic assignment (matching ASVs/OTUs to taxa) happens before edna2obis. Taxo
 - `gbif_use_assignment_score_for_selection`: GBIF only. If true, lineage `assignment_score` is used before GBIF confidence when choosing `selected_match`
 - `gbif_return_higher_classification`: GBIF only. If true, calls the parents endpoint and includes `higherClassification`
 - Local reference database (WoRMS only) for fast AphiaID lookups
+- `worms_return_higher_classification`: WoRMS only. If true, looks up each matched taxon's classification and includes `higherClassification` (see below)
+
+### WoRMS `higherClassification` lookups
+
+With `worms_return_higher_classification: true`, edna2obis makes one WoRMS request per unique matched taxon, up to 6 at a time.
+
+- **Cache:** results are saved to `worms_higherClassification_cache.pkl` in your `output_dir` (`outputs/` by default), shared by every run. The cache is written every 50 lookups and again if the run stops, so an interrupted or failed run keeps its progress and a rerun only fetches what is missing. Caches left in a run's own folder by earlier versions are read and merged in.
+- **Unresponsive WoRMS:** each request gives up after 30 s without data and is retried 3 times. After 10 failures in a row, edna2obis assumes WoRMS is down and stops making lookups. The run still finishes, with `higherClassification` blank for the taxa it couldn't look up, and a warning in the log says how many. Rerun later to fill them in.
 
 Also writes `taxa_mapping_INFO_<API>.xlsx` (sheet `taxa_mapping_INFO`). One row can appear per candidate match, not only the match used in the occurrence file.
 
