@@ -450,6 +450,8 @@ def load_config(config_path="config.yaml"):
         if not safe_run_name:
             safe_run_name = "unnamed_run"
         params['output_dir'] = os.path.join(base_output_dir, safe_run_name)
+        # WoRMS lookup caches are shared by all runs, so they live in the base output folder.
+        params['worms_cache_dir'] = base_output_dir
 
         return params
         
