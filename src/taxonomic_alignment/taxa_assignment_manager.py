@@ -194,6 +194,22 @@ def assign_taxonomy(params, data, raw_data_tables, reporter):
                     params_dict=params,
                     n_proc=params.get('gbif_n_proc', 0)
                 )
+                api_info = params.get('gbif_match_api_info')
+                if api_info:
+                    reporter.add_text(
+                        "Current GBIF name-matching configuration: "
+                        f"{GBIF_matching.gbif_api_label(api_info)}."
+                    )
+                api_used = params.get('gbif_match_api_used') or {}
+                if api_used:
+                    lines = [
+                        f"<li>{label}: {counts['fetched']:,} fetched now, {counts['cached']:,} from cache</li>"
+                        for label, counts in api_used.items()
+                    ]
+                    reporter.add_text(
+                        "GBIF match results used in this run (unique taxonomy strings), by the API that produced them:"
+                        f"<ul>{''.join(lines)}</ul>"
+                    )
                 if params.get('gbif_n_proc_effective', 0) >= 8:
                     reporter.add_warning(
                         f"GBIF used {params['gbif_n_proc_effective']} parallel workers — may hit API rate limits or errors."
