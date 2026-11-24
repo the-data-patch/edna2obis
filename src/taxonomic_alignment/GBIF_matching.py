@@ -205,6 +205,17 @@ def gbif_match_api_info():
     }
 
 
+GBIF_API_LABEL_UNKNOWN = 'an unrecorded pygbif version/API (cached before provenance was tracked)'
+
+
+def gbif_api_label(api_info):
+    """One-line description of a pygbif version/endpoint/checklist, stored with each cached result."""
+    return (
+        f"pygbif {api_info['pygbif_version']}: {api_info['endpoint']} "
+        f"against the {api_info['checklist']}"
+    )
+
+
 def _coerce_gbif_key(value):
     """v2 returns keys as strings; v1 (and the rest of this module) uses ints for Backbone keys."""
     if value is None:
@@ -591,10 +602,8 @@ def get_gbif_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
 
     api_info = gbif_match_api_info()
     params_dict['gbif_match_api_info'] = api_info
-    logging.info(
-        "GBIF name matching: pygbif %s -> %s (%s)",
-        api_info['pygbif_version'], api_info['endpoint'], api_info['checklist'],
-    )
+    current_api_label = gbif_api_label(api_info)
+    logging.info("Current GBIF name-matching configuration: %s", current_api_label)
 
     n_proc = _resolve_gbif_n_proc(n_proc)
     params_dict['gbif_n_proc_effective'] = n_proc
@@ -619,12 +628,19 @@ def get_gbif_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
     cache_file = os.path.join(output_dir, 'gbif_matches_cache_v4.pkl')
     
     # --- Load existing cache if it exists ---
+    # The v4 cache file holds {'results': {lookup: matches}, 'provenance': {lookup: api label}},
+    # so the report can say which pygbif version/API produced each cached result.
     try:
         with open(cache_file, 'rb') as f:
-            cache = pickle.load(f)
+            cache_data = pickle.load(f)
+        if isinstance(cache_data, dict) and 'results' in cache_data:
+            cache = cache_data['results']
+            cache_provenance = cache_data.get('provenance') or {}
+        else:
+            cache, cache_provenance = cache_data, {}
         logging.info(f"Loaded {len(cache)} results from existing GBIF cache file: {cache_file}")
     except (FileNotFoundError, EOFError):
-        cache = {}
+        cache, cache_provenance = {}, {}
         logging.info("No GBIF cache file found or cache is empty. Starting fresh.")
 
     assays_to_skip_species = params_dict.get('assays_to_skip_species_match', [])
@@ -663,7 +679,8 @@ def get_gbif_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
             for key_tuple, result_list in pool.imap_unordered(_gbif_worker, new_lookups):
                 if key_tuple is not None:
                     cache[key_tuple] = result_list
-                
+                    cache_provenance[key_tuple] = current_api_label
+
                 processed_count += 1
                 # Log progress every 20 lookups or on the last one to avoid spamming the console
                 if processed_count % 20 == 0 or processed_count == total_lookups:
@@ -673,8 +690,22 @@ def get_gbif_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
         logging.info(f"Finished matching in {end_time - start_time:.2f} seconds.")
 
         with open(cache_file, 'wb') as f:
-            pickle.dump(cache, f)
+            pickle.dump({'results': cache, 'provenance': cache_provenance}, f)
         logging.info(f"Saved/updated cache with {len(new_lookups)} new results. Cache now contains {len(cache)} total results.")
+
+    # --- Record which API produced the results used in this run (fresh or cached) ---
+    new_lookup_set = set(new_lookups)
+    api_used = {}
+    for lookup in unique_lookups:
+        label = cache_provenance.get(lookup, GBIF_API_LABEL_UNKNOWN)
+        counts = api_used.setdefault(label, {'fetched': 0, 'cached': 0})
+        counts['fetched' if lookup in new_lookup_set else 'cached'] += 1
+    params_dict['gbif_match_api_used'] = api_used
+    for label, counts in api_used.items():
+        logging.info(
+            "GBIF results from %s: %s fetched now, %s from cache",
+            label, counts['fetched'], counts['cached'],
+        )
 
     # --- Process Results and Create DataFrames ---
     main_df_records = []
