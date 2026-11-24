@@ -8,6 +8,7 @@ import multiprocess as mp
 import logging
 import re
 import json
+import inspect
 import urllib.error
 import urllib.request
 
@@ -154,6 +155,116 @@ def _format_environment(record):
         values = [str(value).strip().lower() for value in habitat if str(value).strip()]
         return ';'.join(values) if values else None
     return str(habitat).strip().lower() or None
+
+
+# --- pygbif name_backbone() compatibility ---
+# pygbif <= 0.6.5: name_backbone(name=, rank=) -> GET /v1/species/match against the GBIF Backbone,
+#   returning a flat record (usageKey, scientificName, rank, status, confidence, matchType, kingdom...).
+# pygbif >= 0.6.6: name_backbone(scientificName=, taxonRank=, checklistKey=) -> GET /v2/species/match,
+#   defaulting to the Catalogue of Life Extended Release and returning a nested record
+#   (usage{}, classification[], diagnostics{}, acceptedUsage{}).
+# To keep taxonIDs (gbif:<usageKey>) and the follow-up name_usage()/speciesProfiles lookups consistent,
+# the v2 call is pinned to the GBIF Backbone checklist and its response is flattened to the v1 layout.
+GBIF_BACKBONE_CHECKLIST_KEY = 'd7dddbf4-2cf0-4f39-9b2a-bb099caae36c'
+_V2_CLASSIFICATION_RANKS = ('kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species')
+
+
+def _pygbif_version():
+    try:
+        from importlib.metadata import version
+        return version('pygbif')
+    except Exception:
+        import pygbif
+        return getattr(pygbif, '__version__', 'unknown')
+
+
+def _name_backbone_uses_v2():
+    """True when the installed pygbif has the v2 name_backbone(scientificName=...) signature."""
+    try:
+        return 'scientificName' in inspect.signature(species.name_backbone).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+NAME_BACKBONE_USES_V2 = _name_backbone_uses_v2()
+
+
+def gbif_match_api_info():
+    """Describe which pygbif version and GBIF match endpoint/checklist this run uses."""
+    if NAME_BACKBONE_USES_V2:
+        endpoint = 'GET https://api.gbif.org/v2/species/match'
+        checklist = f'GBIF Backbone Taxonomy (checklistKey={GBIF_BACKBONE_CHECKLIST_KEY})'
+    else:
+        endpoint = 'GET https://api.gbif.org/v1/species/match'
+        checklist = 'GBIF Backbone Taxonomy'
+    return {
+        'pygbif_version': _pygbif_version(),
+        'match_api': 'v2' if NAME_BACKBONE_USES_V2 else 'v1',
+        'endpoint': endpoint,
+        'checklist': checklist,
+    }
+
+
+def _coerce_gbif_key(value):
+    """v2 returns keys as strings; v1 (and the rest of this module) uses ints for Backbone keys."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return int(text) if text.isdigit() else (text or None)
+
+
+def _flatten_v2_match(response):
+    """Convert a /v2/species/match response into the flat /v1/species/match layout."""
+    if not isinstance(response, dict):
+        return {}
+
+    diagnostics = response.get('diagnostics') or {}
+    flat = {
+        'matchType': diagnostics.get('matchType'),
+        'confidence': diagnostics.get('confidence'),
+        'synonym': response.get('synonym'),
+    }
+    if diagnostics.get('note'):
+        flat['note'] = diagnostics['note']
+
+    usage = response.get('usage') or {}
+    if not usage.get('key'):
+        return flat
+
+    flat.update({
+        'usageKey': _coerce_gbif_key(usage.get('key')),
+        'scientificName': usage.get('name'),
+        'canonicalName': usage.get('canonicalName'),
+        'authorship': usage.get('authorship'),
+        'rank': usage.get('rank'),
+        'status': usage.get('status'),
+    })
+
+    for parent in response.get('classification') or []:
+        rank = str(parent.get('rank') or '').lower()
+        if rank in _V2_CLASSIFICATION_RANKS:
+            flat[rank] = parent.get('name')
+            flat[f'{rank}Key'] = _coerce_gbif_key(parent.get('key'))
+
+    accepted = response.get('acceptedUsage') or {}
+    if accepted.get('key'):
+        flat['acceptedUsageKey'] = _coerce_gbif_key(accepted.get('key'))
+        flat['accepted'] = accepted.get('name')
+
+    return flat
+
+
+def _name_backbone_match(name, rank=None, strict=True):
+    """Call pygbif's name_backbone() with whichever signature is installed; always return the v1 layout."""
+    if NAME_BACKBONE_USES_V2:
+        response = species.name_backbone(
+            scientificName=name,
+            taxonRank=rank,
+            strict=strict,
+            checklistKey=GBIF_BACKBONE_CHECKLIST_KEY,
+        )
+        return _flatten_v2_match(response)
+    return species.name_backbone(name=name, rank=rank, strict=strict)
 
 
 GBIF_SPECIES_PROFILES_URL = 'https://api.gbif.org/v1/species/{key}/speciesProfiles'
@@ -418,7 +529,7 @@ def _gbif_worker(args):
                         # Use pygbif's name_backbone to perform a proper match and get a confidence score.
                         # This requires the 'name' parameter, and is the only way to get a confidence value.
                         try:
-                            full_record = species.name_backbone(name=record['scientificName'], rank=record.get('rank'), strict=True)
+                            full_record = _name_backbone_match(record['scientificName'], rank=record.get('rank'), strict=True)
                             if full_record.get('usageKey'):
                                 add_accepted_match(full_record, match_type='LOOKUP_ACCEPTED')
                         except Exception as e_backbone:
@@ -478,6 +589,13 @@ def get_gbif_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
         logging.warning("Input DataFrame is empty. Skipping GBIF matching.")
         return {'main_df': occurrence_df, 'info_df': pd.DataFrame()}
 
+    api_info = gbif_match_api_info()
+    params_dict['gbif_match_api_info'] = api_info
+    logging.info(
+        "GBIF name matching: pygbif %s -> %s (%s)",
+        api_info['pygbif_version'], api_info['endpoint'], api_info['checklist'],
+    )
+
     n_proc = _resolve_gbif_n_proc(n_proc)
     params_dict['gbif_n_proc_effective'] = n_proc
     logging.info("Using %s processes for GBIF name matching (0 in config = auto, max 10)", n_proc)
@@ -497,7 +615,8 @@ def get_gbif_match_for_dataframe(occurrence_df, params_dict, n_proc=0):
     output_dir = params_dict.get('output_dir', '.')
     os.makedirs(output_dir, exist_ok=True)
     # v3: environment from GBIF speciesProfiles; bump file when match/env logic changes so stale cache is not reused.
-    cache_file = os.path.join(output_dir, 'gbif_matches_cache_v3.pkl')
+    # v4: pygbif >= 0.6.6 name_backbone() compatibility; v3 caches written by those versions lack accepted matches.
+    cache_file = os.path.join(output_dir, 'gbif_matches_cache_v4.pkl')
     
     # --- Load existing cache if it exists ---
     try:

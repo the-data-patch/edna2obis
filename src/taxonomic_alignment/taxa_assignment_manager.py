@@ -194,6 +194,12 @@ def assign_taxonomy(params, data, raw_data_tables, reporter):
                     params_dict=params,
                     n_proc=params.get('gbif_n_proc', 0)
                 )
+                api_info = params.get('gbif_match_api_info')
+                if api_info:
+                    reporter.add_text(
+                        f"GBIF name matching used pygbif {api_info['pygbif_version']}: "
+                        f"{api_info['endpoint']} against the {api_info['checklist']}."
+                    )
                 if params.get('gbif_n_proc_effective', 0) >= 8:
                     reporter.add_warning(
                         f"GBIF used {params['gbif_n_proc_effective']} parallel workers — may hit API rate limits or errors."
